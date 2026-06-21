@@ -26,14 +26,14 @@ payload moving through this pipeline.
    ┌──────────────────────────────────────────────────────────────┐
    │                                                              │
    │   master-k3s              worker-k3s-1         worker-k3s-2  │
-   │   (control-plane)         (worker)             (worker)     │
-   │   ┌────────────────┐      ┌──────────────┐    ┌────────────┐│
-   │   │ coredns         │      │ backend pod  │    │ db pod     ││
-   │   │ traefik         │      │              │    │ frontend   ││
-   │   │ metrics-server  │      │              │    │   pod      ││
-   │   │ local-path-     │      │              │    │            ││
-   │   │  provisioner    │      │              │    │            ││
-   │   └────────────────┘      └──────────────┘    └────────────┘│
+   │   (control-plane)         (worker)             (worker)      │
+   │   ┌────────────────┐      ┌──────────────┐    ┌────────────┐ │
+   │   │ coredns        │      │ backend pod  │    │ db pod     │ │
+   │   │ traefik        │      │              │    │ frontend   │ │
+   │   │ metrics-server │      │              │    │   pod      │ │
+   │   │ local-path-    │      │              │    │            │ │
+   │   │  provisioner   │      │              │    │            │ │
+   │   └────────────────┘      └──────────────┘    └────────────┘ │
    └──────────────────────────────────────────────────────────────┘
 ```
 
