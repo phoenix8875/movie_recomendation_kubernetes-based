@@ -1,335 +1,468 @@
-# 🎬 Movie Recommender — Containerized 3-Tier App on AWS
+# 🎬 Movie Recommender — Kubernetes Deployment (k3s)
 
-A three-tier application (frontend, backend, database) packaged with Docker,
-wired together with Docker Compose, and deployed on AWS EC2.
+This is the Kubernetes phase of the project: the same application that
+previously ran via Docker Compose, now deployed on a **k3s cluster** —
+split into three namespaces, one per tier, with each piece wired together
+using core Kubernetes objects.
 
-The app itself recommends movies — but this README focuses on **how the pieces
-talk to each other**: container networking, the nginx reverse proxy, traffic
-flow, and why the same images run anywhere with no reconfiguration. The movie
-logic is just the payload moving through that pipeline.
+This README focuses entirely on the **Kubernetes networking and deployment
+story** — namespaces, Services, cross-namespace DNS, and how traffic actually
+flows from a browser to the database and back. The app itself is just the
+payload moving through this pipeline.
 
 ---
 
 ## 📺 Demo
 
-<!-- TODO: replace with a real demo gif -->
-![App demo](docs/demo.gif)
+<!-- TODO: replace with a real demo gif/screenshot of the app running via the cluster's NodePort -->
+![App demo](docs/k8s-demo.gif)
 
 ---
 
-## 🗺️ Architecture at a glance
-
-Three containers on one private network. **Only the frontend is reachable from
-the internet.** Everything else is internal.
+## 🧱 The cluster
 
 ```
-                          [ USER'S BROWSER ]
-                                  |
-                                  |  all traffic on port 80
-                                  v
-                  ======= AWS Security Group =======
-                  ||      only port 80 is open      ||
-                  ==================================
-                                  |
-   ┌──────────────────────────────┼───────────────────────────────┐
-   │   PRIVATE DOCKER NETWORK      │  (containers talk by name)     │
-   │                               v                                │
-   │        ┌────────────────────────────────────────────┐         │
-   │        │  frontend  (nginx)         host port 80 ◄────┼──── public
-   │        │  • serves the web page                       │         │
-   │        │  • reverse-proxies /api traffic inward       │         │
-   │        └───────────────────────┬────────────────────┘         │
-   │                                │  http://backend:8000           │
-   │                                v                                │
-   │        ┌────────────────────────────────────────────┐         │
-   │        │  backend  (FastAPI)        NO host port      │         │
-   │        │  • application logic + API                   │         │
-   │        └───────────────────────┬────────────────────┘         │
-   │                                │  postgresql://db:5432          │
-   │                                v                                │
-   │        ┌────────────────────────────────────────────┐         │
-   │        │  db  (PostgreSQL)          NO host port      │         │
-   │        │  • persistent data in a docker volume        │         │
-   │        └────────────────────────────────────────────┘         │
-   └────────────────────────────────────────────────────────────────┘
+                         k3s CLUSTER (3 nodes)
+   ┌──────────────────────────────────────────────────────────────┐
+   │                                                              │
+   │   master-k3s              worker-k3s-1         worker-k3s-2  │
+   │   (control-plane)         (worker)             (worker)     │
+   │   ┌────────────────┐      ┌──────────────┐    ┌────────────┐│
+   │   │ coredns         │      │ backend pod  │    │ db pod     ││
+   │   │ traefik         │      │              │    │ frontend   ││
+   │   │ metrics-server  │      │              │    │   pod      ││
+   │   │ local-path-     │      │              │    │            ││
+   │   │  provisioner    │      │              │    │            ││
+   │   └────────────────┘      └──────────────┘    └────────────┘│
+   └──────────────────────────────────────────────────────────────┘
 ```
 
-**Reading this diagram:**
-- The browser can reach **only** the frontend, and only on port 80.
-- The backend and database have **no host port** — nothing outside the private
-  network can connect to them directly.
-- Inside the network, containers reach each other by **name** (`backend`, `db`),
-  not by IP address.
+- **One control-plane node** (`master-k3s`) runs the cluster's own internal
+  machinery — DNS (`coredns`), the built-in load balancer (`traefik`), and a
+  few other system components. Our application pods did **not** land here —
+  the scheduler placed them on the worker nodes instead.
+- **Two worker nodes** run the actual application pods. Which pod lands on
+  which worker is decided automatically by Kubernetes' scheduler — we never
+  specified that ourselves.
+- **`kubectl get pods -A -o wide`** is how you see this for real — the `NODE`
+  column shows exactly where each pod is running.
 
 ---
 
-## 🔁 Network flow: how a request travels
-
-Every API request follows the same path. The browser thinks it's talking to one
-server; really it's hitting nginx, which quietly relays it inward.
+## 📁 Three namespaces, one per tier
 
 ```
-  BROWSER                nginx (frontend)            backend            db
-    │                         │                         │               │
-    │  GET /                  │                         │               │
-    │────────────────────────>│                         │               │
-    │  <── index.html, app.js │                         │               │
-    │                         │                         │               │
-    │  POST /auth/login       │                         │               │
-    │────────────────────────>│                         │               │
-    │                         │  proxy to backend:8000  │               │
-    │                         │────────────────────────>│               │
-    │                         │                         │  SQL query    │
-    │                         │                         │──────────────>│
-    │                         │                         │  <── rows     │
-    │                         │  <── JSON + JWT token   │               │
-    │  <── JSON + JWT token   │                         │               │
-    │                         │                         │               │
+  db-ns            backend-ns            frontend-ns
+  ────────         ─────────────         ─────────────
+  Postgres pod     FastAPI pod           nginx pod
+  PVC (storage)    Secret (JWT/TMDB key) Service (NodePort, public)
+  Secret (creds)   Service (internal)    alias Service -> backend
+  Service          alias Service -> db
+  (internal)
 ```
 
-**What's happening, step by step:**
-- The browser loads the page from nginx over **port 80** (public).
-- When the page makes an API call, it goes to the **same port 80**, because the
-  frontend uses relative URLs (more on this below).
-- nginx looks at the path. `/` → serve a file. `/auth`, `/movies`, `/watchlist`
-  → forward to the backend.
-- The forwarded request travels the **private network** to `backend:8000`. This
-  hop never touches the public internet.
-- The backend queries the database at `db:5432` — also entirely private.
-- Responses travel back out the same chain to the browser.
+A **namespace** is a way to partition one cluster into separate sections —
+same physical nodes, same cluster, just logically grouped. We used three: one
+per tier, mirroring how a real company might split database, backend, and
+frontend ownership across different teams.
+
+**What namespaces give you:**
+- Organization — related resources are grouped and easy to find
+  (`kubectl get all -n backend-ns` shows only backend things).
+- A boundary for **RBAC** (Role-Based Access Control) — you can grant a
+  user/service-account permissions scoped to just one namespace, e.g. "the db
+  team can only act inside `db-ns`."
+- A boundary for resource quotas — limiting how much CPU/memory a namespace
+  can consume in total.
+
+**What namespaces do *not* give you, by default:**
+- **Network isolation.** A pod in `frontend-ns` can still send a network
+  request directly to a pod's IP address in `db-ns` unless something
+  explicitly blocks it. That "something" is a separate object called a
+  **NetworkPolicy**, which we deliberately did not add in this project. So
+  right now, the separation is organizational/administrative, not a network
+  firewall between tiers. Worth being precise about this distinction — it's a
+  common point of confusion.
 
 ---
 
-## 🧭 What is a reverse proxy? (and how this project uses it)
+## 🚧 The core problem: hardcoded hostnames across namespaces
 
-A **reverse proxy** is a server that sits in front of other servers and forwards
-requests to them on the client's behalf. The client only ever talks to the
-proxy; it never knows (or needs to know) what's behind it.
+Both the frontend and backend images have a hostname baked in, unchanged from
+the Docker Compose setup:
 
-In this project, **nginx is the reverse proxy.** It does two jobs at once:
+- **Frontend's nginx config** says: forward API requests to `backend:8000`.
+- **Backend's database connection string** says: connect to `db:5432`.
 
-- **Static file server** — for normal page requests (`/`), it returns the HTML
-  and JavaScript directly.
-- **API gateway** — for API requests (`/auth`, `/movies`, `/watchlist`), it
-  forwards them to the backend container over the private network and relays the
-  response back.
+In Docker Compose, those plain names just worked, because Compose puts
+everything on one shared network. In Kubernetes, a plain name like `backend`
+**only resolves automatically for things inside the same namespace.** Since
+each tier now lives in its *own* namespace, those hardcoded names would fail:
 
-The rule that makes this happen lives in `nginx.conf`:
-
-```nginx
-location /auth/ {
-    proxy_pass http://backend:8000;
-}
+```
+  frontend pod (in frontend-ns)  --- "backend" ---> ??? NOT FOUND
+  backend pod  (in backend-ns)   --- "db" -------->  ??? NOT FOUND
 ```
 
-In plain terms: *"any request starting with `/auth/`, hand off to the container
-named `backend` on port 8000, and return whatever it says."*
-
-**Why a reverse proxy is worth using here:**
-- **One public door.** The browser only talks to nginx. The backend and database
-  stay private — fewer exposed services means a smaller attack surface.
-- **No port juggling.** Without it, the browser would need to hit the backend on
-  its own public port (e.g. `:8000`), meaning extra firewall rules and the
-  backend's address baked into the frontend. The proxy removes all of that.
-- **Same origin = no CORS headaches.** Because the page and its API calls both
-  come from port 80, the browser sees them as the same origin — no
-  cross-origin configuration needed.
-- **A single place to add cross-cutting features later** — TLS/HTTPS,
-  rate limiting, caching, logging — all slot into nginx without touching the app.
+We deliberately did **not** rebuild the images or edit any code to fix this —
+that would mean rebuilding/pushing new images every time the cluster topology
+changes, which doesn't scale. Instead, we fixed it entirely at the Kubernetes
+configuration level.
 
 ---
 
-## 🌍 Why it runs anywhere with zero reconfiguration
+## 🔑 The fix: ExternalName alias Services
 
-A classic problem: the frontend needs to know the backend's address. Hardcode an
-IP and it breaks the moment that IP changes (which EC2 IPs do on restart).
+Kubernetes lets you create a Service whose entire job is to be a **DNS
+alias** — "whenever something asks for this name, silently redirect to a
+different name instead." This object type is called `ExternalName`.
 
-This project avoids that completely using **relative URLs**.
+We created one tiny alias Service inside each namespace that needed to reach
+across to another:
 
 ```
-  The frontend code calls:        fetch("/auth/login")
-                                          │
-                                          │  no host, no port, no IP
-                                          v
-  Browser fills in automatically:  http://<whatever-loaded-the-page>/auth/login
+  INSIDE backend-ns:                    INSIDE frontend-ns:
+  ┌─────────────────────────┐           ┌────────────────────────────────┐
+  │  Service named "db"     │           │  Service named "backend"       │
+  │  type: ExternalName     │           │  type: ExternalName            │
+  │  points to:             │           │  points to:                    │
+  │  db.db-ns.svc.cluster   │           │  backend.backend-ns.svc.cluster│
+  │  .local                 │           │  .local                        │
+  └─────────────────────────┘           └────────────────────────────────┘
+         │                                         │
+         │  backend pod asks for "db"              │  frontend's nginx asks
+         │  -> gets redirected to the              │  for "backend"
+         v  REAL db Service in db-ns               v  -> gets redirected to the
+  ┌─────────────────┐                        REAL backend Service in backend-ns
+  │ db Service      │                       ┌──────────────────┐
+  │ (in db-ns)      │                       │ backend Service  │
+  │ -> Postgres pod │                       │ (in backend-ns)  │
+  └─────────────────┘                       │ -> FastAPI pod   │
+                                            └──────────────────┘
 ```
 
-- Open the app at `localhost` → the call goes to `localhost`.
-- Open it at an EC2 IP → the call goes to that EC2 IP.
-- Open it at a domain name later → the call goes to that domain.
+**In plain terms:** the backend pod still thinks it's talking to something
+called `db`, exactly like before. It has no idea that name is secretly an
+alias being redirected to a completely different namespace. Same story for
+the frontend talking to `backend`. **Zero code changes, zero image rebuilds —
+the fix lives entirely in two small YAML files.**
 
-The frontend never contains a hardcoded address. nginx receives every call on
-port 80 and routes it inward. **Result: the exact same Docker image runs on a
-laptop, any EC2 instance, or behind a domain — no edits, no rebuild, no config.**
-The only requirement on the server is that port 80 is open.
+This is the single most important trick in this deployment — it's what makes
+namespace separation actually *work* without breaking the existing images.
 
 ---
 
-## 🔌 How containers find each other (Docker networking)
+## 🔁 Request flow — browser to database and back
 
-When Docker Compose starts the app, it creates a **private virtual network** and
-attaches all three containers to it. On that network, each container is reachable
-by its **service name** — Docker runs an internal DNS that resolves names to the
-right container automatically.
+The user signs up. Traffic travels DOWN through the three namespaces to the
+database, then the response travels back UP the exact same path.
 
 ```
-  service name      used in                       resolves to
-  -------------     ---------------------------   --------------------
-  db                backend's DATABASE_URL        the database container
-  backend           nginx's proxy_pass rule       the backend container
-  frontend          mapped to host port 80        the public entry point
+   +-------------+
+   |   BROWSER   |   http://<ec2-ip>:30080/auth/signup
+   +------+------+
+          |
+          v
+====================== frontend-ns ==============================
+|                                                               |
+|   +------------------------+                                  |
+|   | frontend Service       |   type: NodePort (port 30080)    |
+|   | (the public door)      |                                  |
+|   +-----------+------------+                                  |
+|               |                                               |
+|               v                                               |
+|   +------------------------+                                  |
+|   | frontend POD (nginx)   |   rule: /auth/ -> backend:8000   |
+|   +-----------+------------+                                  |
+|               |  asks DNS for "backend"                       |
+|               v                                               |
+|   +------------------------+                                  |
+|   | "backend" ALIAS        |   type: ExternalName             |
+|   | (DNS redirect only)    |   -> backend.backend-ns.svc...   |
+|   +-----------+------------+                                  |
+|               |                                               |
+================|===============================================
+                |  (crosses the namespace boundary)
+                v
+====================== backend-ns ===============================
+|               |                                               |
+|               v                                               |
+|   +------------------------+                                  |
+|   | backend Service        |   type: ClusterIP (internal)     |
+|   +-----------+------------+                                  |
+|               |                                               |
+|               v                                               |
+|   +------------------------+                                  |
+|   | backend POD (FastAPI)  |   conn: ...@db:5432              |
+|   +-----------+------------+                                  |
+|               |  asks DNS for "db"                            |
+|               v                                               |
+|   +------------------------+                                  |
+|   | "db" ALIAS             |   type: ExternalName             |
+|   | (DNS redirect only)    |   -> db.db-ns.svc...             |
+|   +-----------+------------+                                  |
+|               |                                               |
+================|===============================================
+                |  (crosses the namespace boundary)
+                v
+======================== db-ns ==================================
+|               |                                               |
+|               v                                               |
+|   +------------------------+                                  |
+|   | db Service             |   type: ClusterIP (internal)     |
+|   +-----------+------------+                                  |
+|               |                                               |
+|               v                                               |
+|   +------------------------+                                  |
+|   | Postgres POD           |   reads/writes PVC storage       |
+|   +------------------------+                                  |
+|                                                               |
+=================================================================
+
+   Response travels back UP the same path, in reverse:
+   Postgres -> db Svc -> backend POD -> backend Svc ->
+   nginx -> frontend Svc -> browser
 ```
 
-- That's why the backend connects to `postgresql://...@db:5432` — `db` is a
-  hostname Docker provides, not an IP anyone configured.
-- That's why nginx forwards to `http://backend:8000` — same idea.
-- **No IP addresses appear anywhere** in the config. Containers can be recreated,
-  restarted, or rescheduled and the names still resolve.
+**Step by step, what happens at each hop:**
 
-**Ports — public vs. internal:**
-- A `ports:` mapping like `"80:80"` opens a door from the **host machine** to a
-  container. Only the frontend has one.
-- The backend listens on `8000` and the database on `5432`, but **only inside the
-  private network** — no `ports:` mapping means no door from the outside world.
+- **Browser -> frontend Service.** The user hits `http://<ec2-ip>:30080`.
+  That port is opened on every cluster node by the frontend's **NodePort**
+  Service — the single public entry point. Nothing else in the cluster is
+  reachable from outside.
+
+- **frontend Service -> frontend pod (nginx).** The Service forwards the
+  request to the nginx pod. nginx checks the URL path: anything starting with
+  `/auth/`, `/movies`, or `/watchlist` is an API call, so its config forwards
+  it to `http://backend:8000`.
+
+- **nginx asks DNS for "backend".** The catch: nginx is in `frontend-ns`, but
+  the real backend is in `backend-ns`, so the plain name `backend` wouldn't
+  normally resolve. It works only because we placed a **`backend`
+  ExternalName alias** inside `frontend-ns`. This alias is not a server — it's
+  a pure DNS redirect meaning "`backend` really points to
+  `backend.backend-ns.svc.cluster.local`."
+
+- **Alias crosses the boundary -> backend Service.** The redirected name now
+  points at the real **backend ClusterIP Service** in `backend-ns`. ClusterIP
+  means internal-only — correct, since only nginx (never the browser) should
+  reach it.
+
+- **backend Service -> backend pod (FastAPI).** The Service routes to the
+  FastAPI pod, which processes the signup: validates input, hashes the
+  password. To store it, it needs the database — and its connection string
+  uses the host `db`.
+
+- **FastAPI asks DNS for "db".** Same trick, one tier deeper. The backend pod
+  is in `backend-ns`, the database in `db-ns`, so plain `db` wouldn't resolve
+  — except we placed a **`db` ExternalName alias** inside `backend-ns`,
+  redirecting to `db.db-ns.svc.cluster.local`.
+
+- **Alias crosses the boundary -> db Service -> Postgres pod.** The redirect
+  lands on the real **db ClusterIP Service** in `db-ns`, which routes to the
+  Postgres pod. Postgres writes the new user row to its **PVC-backed
+  storage**, so the data survives even if the pod is restarted later.
+
+- **Response travels back up the identical chain, in reverse** — Postgres ->
+  db Service -> backend pod -> backend Service -> nginx -> frontend Service ->
+  browser. The account is created, and from the browser's point of view it all
+  came from one address on port 30080.
+
+**The one-line takeaway:** traffic crosses two namespace boundaries (and
+possibly two different physical worker nodes), yet neither nginx nor FastAPI
+knows any of that — each just talks to a plain name (`backend`, `db`), and the
+two ExternalName aliases quietly handle the cross-namespace redirect with zero
+code changes.
 
 ---
 
-## 🏗️ Build & deploy flow
-
-Images are built once, pushed to Docker Hub, then pulled onto the server. The
-server never needs the source code.
+## ⚙️ What we built, folder by folder
 
 ```
-   YOUR MACHINE                      DOCKER HUB                  EC2 SERVER
-  ──────────────                    ───────────                ────────────
-   docker build  ───────push───────>  backend:2.0  ───pull────>  run
-   docker build  ───────push───────> frontend:2.0  ───pull────>  run
-                                     postgres:16   ───pull────>  run
-                                     (official image)
-
-   needs: source code               stores: images             needs: only
-          + Dockerfiles                                          compose file
-                                                                 + .env
+k8s/
+├── 00-namespaces.yaml          # creates db-ns, backend-ns, frontend-ns
+│
+├── db/
+│   ├── 02-secret.yaml          # Postgres username/password/db name
+│   ├── 03-pvc.yaml             # persistent storage request
+│   ├── 04-deployment.yaml      # the Postgres pod
+│   └── 05-service.yaml         # gives Postgres the stable name "db"
+│
+├── backend/
+│   ├── 01-db-alias-service.yaml   # ExternalName: makes "db" resolve here
+│   ├── 02-secret.yaml              # JWT key, TMDB key, DATABASE_URL
+│   ├── 03-deployment.yaml          # the FastAPI pod
+│   └── 04-service.yaml             # gives backend the stable name "backend"
+│
+└── frontend/
+    ├── 01-backend-alias-service.yaml  # ExternalName: makes "backend" resolve here
+    ├── 02-deployment.yaml             # the nginx pod
+    └── 03-service.yaml                # NodePort — the one externally reachable piece
 ```
 
-- **Build** turns your code + Dockerfile into an image.
-- **Push** uploads that image to Docker Hub (a registry).
-- **Pull** downloads it on any machine — the server just runs the finished image.
-- The database image (`postgres`) isn't built by us; it's an official image
-  pulled straight from Docker Hub.
+### `db/` — what each file does
+
+- **Secret** — stores `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` as
+  key-value pairs. Kubernetes stores these **base64-encoded**, not encrypted
+  — that's an important distinction. Encoding is not encryption; anyone with
+  permission to read the Secret object can trivially decode it. Real
+  protection comes from controlling *who* can read Secrets (RBAC) and, in
+  production clusters, enabling encryption-at-rest.
+- **PVC (PersistentVolumeClaim)** — a request for storage that survives pod
+  restarts. Pods are disposable; if the Postgres pod is destroyed and
+  recreated, a fresh pod with no PVC would start with a completely empty,
+  brand-new database. The PVC is what makes data durable across that churn.
+  k3s automatically provisions the actual storage behind this request.
+- **Deployment** — describes the Postgres pod: which image, which port, how
+  it gets its credentials (`envFrom` pulls the whole Secret in as environment
+  variables), and where the PVC gets mounted inside the container.
+- **Service** — gives the Postgres pod a stable name (`db`) and stable
+  virtual IP, so that name keeps working even if the underlying pod is
+  replaced.
+
+### `backend/` — what each file does
+
+- **ExternalName alias Service** — the fix described above. Makes `db`
+  resolve correctly from inside `backend-ns`.
+- **Secret** — JWT signing key, TMDB API key, and the full database
+  connection string (which still just says `db` as the host — the alias
+  handles the rest).
+- **Deployment** — the FastAPI pod. No persistent volume needed here, because
+  the backend itself stores no data — everything it needs lives in Postgres.
+  That statelessness is also why this tier is the easiest one to scale to
+  multiple replicas later.
+- **Service** — gives the backend pod the stable name `backend`, which the
+  frontend's alias (next folder) points to.
+
+### `frontend/` — what each file does
+
+- **ExternalName alias Service** — makes `backend` resolve correctly from
+  inside `frontend-ns`, fixing nginx's hardcoded `proxy_pass`.
+- **Deployment** — the nginx pod. No secrets or special config — it just
+  serves static files and proxies API calls.
+- **Service (NodePort)** — the only Service in the entire project that needs
+  to be reachable from *outside* the cluster. Real users hit this one.
 
 ---
 
-## 🔒 Security model
+## 🌐 ClusterIP vs NodePort vs ExternalName — why each was chosen
 
-- **Port 80 is the only thing open.** Backend and database are unreachable from
-  the public internet — they exist only on the private Docker network.
-- **Secrets live in `.env`**, never committed to the repository. Database
-  password, the token-signing key, and the API key all come from there.
-- **Passwords are hashed** (bcrypt), never stored in plain text.
-- **Sessions use signed JWT tokens** rather than server-side session state.
+| Service type | Used for | Reachable from |
+|---|---|---|
+| **ClusterIP** (default) | `db`, `backend` | Only inside the cluster |
+| **NodePort** | `frontend` | Outside the cluster, on a specific port |
+| **ExternalName** | the two alias Services | Anywhere inside the cluster — it's a DNS redirect, not a real network endpoint |
+
+- **ClusterIP** is the right choice whenever nothing outside the cluster
+  should ever connect directly — true for both Postgres and the backend API.
+  The browser should never talk to either of these directly; it only ever
+  talks to nginx.
+- **NodePort** opens a specific port (we used `30080`, inside Kubernetes'
+  default NodePort range of 30000–32767) on *every* node in the cluster, and
+  forwards traffic from that port into the target Service. It's the simplest
+  way to expose something externally on a small/learning cluster. A
+  production setup would more likely use a `LoadBalancer` type Service
+  (provisioning a real cloud load balancer) or an `Ingress` — both are
+  natural next steps beyond this project.
+- **ExternalName** isn't really a network endpoint at all — it's pure DNS
+  redirection, which is exactly why it was the right tool for solving the
+  cross-namespace hostname problem with zero code changes.
 
 ---
 
-## 🚀 Run it locally
+## 🧩 Key concepts glossary (plain language)
+
+- **Namespace** — a logical folder inside one cluster, used to group and
+  separate resources administratively (not a network firewall by itself).
+- **Pod** — the smallest deployable unit in Kubernetes; in this project, one
+  container per pod.
+- **Deployment** — a controller that keeps a specified number of pod copies
+  running, replacing them automatically if they crash or are deleted.
+- **Service** — a stable name + virtual IP that routes to whichever pod(s)
+  currently match its label selector, regardless of how many times those
+  pods get replaced underneath it.
+- **Secret** — a Kubernetes object for storing sensitive config, encoded
+  (not encrypted) in base64.
+- **PersistentVolumeClaim (PVC)** — a request for storage that outlives any
+  individual pod.
+- **Scheduler** — the cluster component that decides which node a new pod
+  runs on, based on available resources and any constraints you've set (we
+  set none, so it chose freely between the two worker nodes).
+- **Taint** — a marker on a node that repels pods unless they explicitly
+  "tolerate" it. Standard Kubernetes taints control-plane nodes by default so
+  application pods avoid them; k3s does not do this automatically.
+- **DaemonSet** — a controller that runs exactly one copy of a pod on *every*
+  node, no exceptions (you can see this cluster's own `svclb-traefik` pods
+  doing exactly this, one per node, used internally by k3s's load balancer).
+
+---
+
+## 🚀 Deploying this yourself
+
+Apply in this order — namespaces first, then each tier (db before backend,
+since backend's alias depends on db already existing as a concept; backend
+before frontend, same reasoning):
 
 ```bash
-cp .env.example .env        # then fill in real values
-docker compose up --build
-```
-Open **http://localhost:8081**
+kubectl apply -f 00-namespaces.yaml
 
-```bash
-docker compose down         # stop, keep data
-docker compose down -v      # stop, wipe the database volume
+kubectl apply -f db/02-secret.yaml
+kubectl apply -f db/03-pvc.yaml
+kubectl apply -f db/04-deployment.yaml
+kubectl apply -f db/05-service.yaml
+
+kubectl apply -f backend/01-db-alias-service.yaml
+kubectl apply -f backend/02-secret.yaml
+kubectl apply -f backend/03-deployment.yaml
+kubectl apply -f backend/04-service.yaml
+
+kubectl apply -f frontend/01-backend-alias-service.yaml
+kubectl apply -f frontend/02-deployment.yaml
+kubectl apply -f frontend/03-service.yaml
 ```
 
-Generate a secure token key for `.env`:
+**Verify each tier as you go:**
 ```bash
-python3 -c "import secrets; print(secrets.token_hex(32))"
+kubectl get all -n db-ns
+kubectl get all -n backend-ns
+kubectl get all -n frontend-ns
+```
+
+**Open the NodePort in your EC2 Security Group** (inbound rule, port `30080`,
+source `0.0.0.0/0`), then visit:
+
+```
+http://<ec2-public-ip>:30080
 ```
 
 ---
 
-## ☁️ Deploy on AWS EC2
+## 🔍 Useful diagnostic commands
 
-**1. Build & push (from your machine):**
 ```bash
-docker build -t <user>/movie-recommender-backend:2.0 ./backend
-docker build -t <user>/movie-recommender-frontend:2.0 ./frontend
-docker push <user>/movie-recommender-backend:2.0
-docker push <user>/movie-recommender-frontend:2.0
+# See every pod across the whole cluster, and which node each landed on
+kubectl get pods -A -o wide
+
+# Check whether the master node is tainted against regular pods
+kubectl describe node master-k3s | grep -A 3 Taints
+
+# Confirm a cross-namespace alias actually resolves, from inside a pod
+kubectl exec -n backend-ns deployment/backend-deployment -- getent hosts db
+
+# Watch a pod's logs live
+kubectl logs -n backend-ns deployment/backend-deployment -f
+
+# If something's stuck, get the full event history for the pod
+kubectl describe pod -n backend-ns <pod-name>
 ```
-
-**2. EC2 Security Group — open only:**
-
-| Port | Purpose |
-|------|---------|
-| 22 | SSH (restrict to your IP) |
-| 80 | The app (open to all) |
-
-**3. On the server** — copy up just `docker-compose.ec2.yml` and `.env`, then:
-```bash
-docker compose -f docker-compose.ec2.yml --env-file .env up -d
-```
-Open **http://&lt;ec2-public-ip&gt;** — no port number, it's on port 80.
-
----
-
-## 📁 Project structure
-
-```
-movie-recommender/
-├── frontend/                   # nginx + static UI (the public entry point)
-│   ├── nginx.conf              # serves files + reverse-proxies the API  ← key file
-│   ├── app.js                  # uses relative URLs (no hardcoded host)
-│   ├── index.html
-│   └── Dockerfile
-├── backend/                    # FastAPI service (internal only)
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── routers/            # /auth, /movies, /watchlist
-│   │   └── ...
-│   ├── requirements.txt
-│   └── Dockerfile
-├── docker-compose.yml          # local: builds images from source
-├── docker-compose.ec2.yml      # server: pulls prebuilt images
-├── .env.example
-└── README.md
-```
-
----
-
-## 📡 API endpoints (what flows through the proxy)
-
-| Endpoint | Method | Auth | Reached via |
-|----------|--------|:---:|-------------|
-| `/auth/signup` | POST | – | nginx → backend |
-| `/auth/login` | POST | – | nginx → backend |
-| `/movies` | GET | – | nginx → backend |
-| `/movies/recommend` | POST | – | nginx → backend |
-| `/watchlist` | GET / POST / DELETE | ✓ | nginx → backend |
-
-Every one of these is a relative path the browser sends to port 80; nginx
-forwards it to `backend:8000` internally.
 
 ---
 
 ## 🛠️ Tech stack
 
-- **Reverse proxy / web server:** nginx
-- **Backend:** Python, FastAPI
-- **Database:** PostgreSQL
-- **Containerization:** Docker, Docker Compose
-- **Cloud:** AWS EC2
-- **App logic (the payload):** scikit-learn content-based recommender
-
----
-
-## 🧩 The app, briefly
-
-So the data flow has meaning: users sign up, pick movies or genres they like, and
-get back similar films (matched with a TF-IDF + cosine-similarity model over a
-~210-film dataset) which they can save to a personal watchlist. That's the
-content moving through the networking pipeline described above — the focus of
-this project is the pipeline, not the recommender.
+- **Orchestration:** Kubernetes (k3s), 3-node cluster (1 control-plane, 2 workers)
+- **Networking:** Kubernetes Services (ClusterIP, NodePort, ExternalName),
+  cluster-internal DNS
+- **Containers:** the same Docker images built in the Docker Compose phase
+- **Storage:** PersistentVolumeClaim, backed by k3s's local-path-provisioner
+- **Secrets:** Kubernetes Secrets (base64-encoded config)
