@@ -1,0 +1,41 @@
+# backend/03-deployment.yaml
+#
+# WHAT THIS FILE DOES:
+# Runs the FastAPI backend pod, pulling its image straight from Docker Hub.
+#
+# HOW CONFIG GETS IN:
+# envFrom -> secretRef injects all four keys from backend-secrets as
+# environment variables — config.py already reads these via os.getenv(),
+# exactly as it did with Docker Compose's environment: block. No code
+# changes needed.
+#
+# WHY NO volumeMounts HERE:
+# Unlike the db tier, the backend is stateless — it keeps no data of its
+# own (everything persists in Postgres). So pods can be freely destroyed
+# and recreated with no data loss, which is exactly why this tier is a
+# good candidate to scale to multiple replicas later (we're using 1 for
+# now to keep it simple while we verify connectivity).
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-deployment
+  namespace: backend-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: raj8875/movie-recommender-backend:2.0
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: backend-secrets

@@ -1,0 +1,21 @@
+# frontend/01-backend-alias-service.yaml
+#
+# WHAT THIS FILE DOES:
+# Same trick as the db alias, one tier over. Creates a Service named
+# "backend" inside frontend-ns that's really just a DNS pointer to the real
+# backend Service living in backend-ns.
+#
+# WHY WE NEED THIS (Problem 1 from earlier):
+# nginx.conf has "proxy_pass http://backend:8000;" baked into the image.
+# That only resolves automatically within backend-ns. The frontend pod lives
+# in frontend-ns, so without this alias, nginx would fail to reach the
+# backend at all — same class of problem as the db alias, different tier.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: frontend-ns
+spec:
+  type: ExternalName
+  externalName: backend.backend-ns.svc.cluster.local

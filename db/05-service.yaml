@@ -1,0 +1,37 @@
+# db/05-service.yaml
+#
+# WHAT THIS FILE DOES:
+# Creates a Service named "db" that sits in front of the Postgres pod(s).
+#
+# WHY A SERVICE IS NEEDED AT ALL:
+# Pods are disposable — every time one restarts, it gets a brand new IP
+# address. If the backend connected directly to a pod IP, it would break on
+# every restart. A Service gives a STABLE name and IP that automatically
+# routes to whichever pod(s) currently match its selector, no matter how
+# many times those pods get replaced underneath it.
+#
+# WHY THE NAME "db" MATTERS:
+# Kubernetes automatically creates a DNS entry for every Service, in the
+# form <service-name>.<namespace>.svc.cluster.local — and just
+# <service-name> works for anything inside the SAME namespace. Since this
+# Service is named "db" and lives in db-ns, anything inside db-ns can reach
+# Postgres just by connecting to the hostname "db". From OUTSIDE db-ns
+# (e.g. from backend-ns), this name does NOT resolve on its own — that's
+# exactly the cross-namespace problem we'll solve next with an ExternalName
+# alias Service inside backend-ns.
+#
+# type: ClusterIP (the default) means this Service is only reachable from
+# INSIDE the cluster — correct here, since nothing outside the cluster
+# should ever talk to Postgres directly.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: db-ns
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

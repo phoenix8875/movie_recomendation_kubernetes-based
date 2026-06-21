@@ -1,0 +1,59 @@
+# db/04-deployment.yaml
+#
+# WHAT THIS FILE DOES:
+# Defines and runs the Postgres pod itself — equivalent to the "db" service
+# in docker-compose.yml, just expressed as a Deployment.
+#
+# WHY A DEPLOYMENT:
+# A Deployment tells Kubernetes "keep exactly this many copies of this pod
+# running, always." If the pod crashes, the Deployment notices and starts a
+# replacement automatically. We use replicas: 1 here — Postgres isn't
+# designed to run as multiple writable copies without extra replication
+# setup, so more than 1 replica would actually break things, not help.
+#
+# HOW THE PIECES CONNECT:
+# - envFrom -> secretRef pulls ALL three keys from db-credentials Secret
+#   straight into environment variables inside the container, without
+#   listing them one by one.
+# - volumeMounts + volumes wires the PVC we created into the exact path
+#   Postgres writes its data files to (/var/lib/postgresql/data).
+# - selector / matchLabels / template.metadata.labels: this trio is how the
+#   Deployment "owns" its pods. The Deployment watches for pods matching
+#   these labels and creates new ones if the count drops below `replicas`.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db-deployment
+  namespace: db-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: db-credentials
+          volumeMounts:
+            - name: db-storage
+              mountPath: /var/lib/postgresql/data
+              # Postgres requires its data directory to be EMPTY on first
+              # boot, but most PVC implementations create a hidden
+              # "lost+found" folder at the mount root. subPath gives
+              # Postgres its own clean subfolder inside the volume instead
+              # of the raw mount root, avoiding an "initdb" failure.
+              subPath: postgres-data
+      volumes:
+        - name: db-storage
+          persistentVolumeClaim:
+            claimName: db-pvc

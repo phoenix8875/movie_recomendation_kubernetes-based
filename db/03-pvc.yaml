@@ -1,0 +1,30 @@
+# db/03-pvc.yaml
+#
+# WHAT THIS FILE DOES:
+# Requests persistent storage for Postgres — a PersistentVolumeClaim (PVC).
+#
+# WHY THIS MATTERS:
+# Containers are disposable by design — if the Postgres pod crashes or gets
+# rescheduled, Kubernetes creates a brand new pod from scratch. Without a
+# PVC, all your data (users, watchlists) would vanish every time that
+# happens, because it'd only exist inside that one pod's writable layer.
+#
+# A PVC is a request: "give me 2Gi of storage that survives pod restarts."
+# k3s ships with a default StorageClass ("local-path") that automatically
+# creates the actual storage on the node when this PVC is created — that's
+# why we don't have to manually define a PersistentVolume ourselves here.
+#
+# accessModes: ReadWriteOnce means this volume can be mounted read-write by
+# one pod at a time — correct for a single Postgres instance.
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-pvc
+  namespace: db-ns
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

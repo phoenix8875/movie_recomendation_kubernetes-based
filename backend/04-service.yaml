@@ -1,0 +1,25 @@
+# backend/04-service.yaml
+#
+# WHAT THIS FILE DOES:
+# Gives the backend pod a stable name — "backend" — inside backend-ns.
+# This is the Service that the frontend's alias (next folder) will point to.
+#
+# Same reasoning as the db Service: pods get recreated with new IPs, this
+# Service gives callers (in this case, the frontend's alias) something
+# stable to target regardless of what's happening underneath.
+#
+# type: ClusterIP — internal only, nothing outside the cluster needs to
+# reach the backend directly. Browsers never connect to it; nginx does,
+# internally.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: backend-ns
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 8000
+      targetPort: 8000

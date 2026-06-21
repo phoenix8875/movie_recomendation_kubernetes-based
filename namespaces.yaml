@@ -1,0 +1,36 @@
+# 00-namespaces.yaml
+#
+# WHAT THIS FILE DOES:
+# Creates three separate namespaces — one per tier. A namespace is a
+# Kubernetes concept for partitioning a cluster into virtual "folders." Every
+# resource we create later (Deployments, Services, Secrets, PVCs) will be
+# placed into one of these three, instead of the cluster's default namespace.
+#
+# WHY WE'RE DOING THIS:
+# In a real organization, the database team, backend team, and frontend team
+# are often different people with different access levels. Namespaces are
+# the boundary Kubernetes RBAC (Role-Based Access Control) uses to enforce
+# that — e.g. "the db team's service account can only act inside db-ns."
+#
+# WHAT THIS DOES NOT DO:
+# Namespaces do NOT block network traffic between pods in different
+# namespaces by default. A pod in frontend-ns can still send a network
+# request directly to a pod's IP in db-ns unless a NetworkPolicy says
+# otherwise. We are not adding NetworkPolicies in this project (yet) — so
+# right now this is organizational/administrative separation, not network
+# isolation. Worth knowing the difference, especially in an interview.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: db-ns
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backend-ns
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: frontend-ns

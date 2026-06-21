@@ -1,0 +1,30 @@
+# frontend/02-deployment.yaml
+#
+# WHAT THIS FILE DOES:
+# Runs the nginx + static-files frontend pod.
+#
+# NOTHING SPECIAL CONFIG-WISE HERE — no envFrom, no secrets. The frontend
+# image has no sensitive config; it just serves static files and proxies
+# API calls using the hardcoded "backend" hostname, which the alias above
+# now makes resolvable.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-deployment
+  namespace: frontend-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: raj8875/movie-recommender-frontend:2.0
+          ports:
+            - containerPort: 80

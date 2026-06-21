@@ -1,0 +1,32 @@
+# backend/01-db-alias-service.yaml
+#
+# WHAT THIS FILE DOES:
+# Creates a Service named "db" — but INSIDE backend-ns this time, not db-ns.
+# This is NOT a real database. It's an alias/redirect: type ExternalName
+# means "whenever something asks for the hostname 'db', don't route to a
+# pod — instead, treat the request as if it were addressed to this other
+# DNS name instead."
+#
+# WHY WE NEED THIS (Problem 2 from earlier):
+# The backend's DATABASE_URL is postgresql://...@db:5432/... — that "db"
+# hostname only resolves automatically within db-ns. The backend pod lives
+# in backend-ns, so without this file, "db" would fail to resolve and the
+# backend would crash trying to connect.
+#
+# We cannot and do not want to edit the backend's code/image to hardcode a
+# longer cross-namespace name — instead, we make "db" resolve correctly
+# FROM INSIDE backend-ns by creating this local alias. The backend
+# continues to connect to a hostname called "db", completely unaware that
+# real Postgres actually lives in a different namespace.
+#
+# externalName must be the FULL cross-namespace DNS form:
+# <service>.<namespace>.svc.cluster.local
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: backend-ns
+spec:
+  type: ExternalName
+  externalName: db.db-ns.svc.cluster.local
