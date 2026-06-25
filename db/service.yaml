@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: db-ns
+spec:
+  clusterIP: None        # headless — the StatefulSet pattern
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432

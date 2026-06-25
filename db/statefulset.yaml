@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db                       # pod will be named db-0
+  namespace: db-ns
+spec:
+  serviceName: db                # must match the headless Service name below
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres              # confirmed: matches your existing pod + service selector
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine     # confirmed: same image you run now
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: db-credentials     # confirmed: same secret your deployment used
+          volumeMounts:
+            - name: db-storage
+              mountPath: /var/lib/postgresql/data
+              subPath: postgres-data     # confirmed: keep this, your old deployment used it
+  # Replaces your old db-pvc. Auto-creates PVC: db-storage-db-0
+  volumeClaimTemplates:
+    - metadata:
+        name: db-storage
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 100Mi               # set to whatever your old db-pvc was (data is being wiped anyway)
