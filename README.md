@@ -1,324 +1,295 @@
-# Movie Watchlist — Helm Chart Explained
+# 🎬 Movie Watchlist — Kubernetes (k3s) 3-Tier App
 
-A walk-through of how this 3-tier app (Nginx frontend → FastAPI backend → Postgres db)
-was turned into a Helm chart, and how every file connects to every other.
+A three-tier movie app — **Nginx frontend → Node.js API → PostgreSQL** — deployed on a **k3s cluster** on EC2. Each tier runs in its own namespace, and only the frontend is exposed to the internet. The backend and database have no public ports and are reachable only from inside the cluster.
 
----
-
-## 1. What Helm Is (in brief)
-
-Helm is a **templating + packaging layer on top of Kubernetes**. It does not replace
-your Kubernetes knowledge — it wraps it. Under the hood it still produces the same
-Deployments, Services, Secrets, and StatefulSets you would write by hand.
-
-The core idea:
-
-```
-  YOUR YAML with blanks        +        ONE answers file        =     PLAIN K8S YAML
-  (templates/*.yaml)                    (values.yaml)                 (what gets applied)
-  image: {{ .Values...}}                backend.image.tag: "2.0"      image: raj8875/...:2.0
-```
-
-Helm **renders** (templates + values → plain YAML), then **applies** the result to the
-cluster and remembers it as a versioned *release* you can upgrade or roll back.
-
-Three terms to keep straight:
-
-| Term | Meaning |
-|:---|:---|
-| **Chart** | The package — the folder of templates + values. The "recipe." |
-| **Release** | One installed instance of a chart on a cluster. The "cooked meal." |
-| **Revision** | A numbered snapshot of a release. Each `install`/`upgrade` makes a new one. |
-
-Why it beats `kubectl apply -f`:
-- One command (`helm install`) replaces the four ordered `kubectl apply` commands.
-- One file (`values.yaml`) holds every knob — no hunting through 11 files to change a tag.
-- Every deploy is reversible: `helm rollback` undoes a bad change instantly.
-- The same chart spins up staging/prod variants via `--set` or a second values file.
+![App Preview](ss/preview_live.gif)
 
 ---
 
-## 2. Project Structure
+## Cluster Topology
 
 ```
-movie-watchlist/
-├── Chart.yaml            # metadata: chart name + two version numbers
-├── values.yaml           # THE ANSWERS SHEET — every knob lives here
-└── templates/            # your old manifests, with {{ }} blanks
-    │
-    ├── namespaces.yaml              # creates the 3 namespaces (loops over values)
-    │
-    ├── db-secret.yaml               # ─┐
-    ├── db-statefulset.yaml          #  ├─ DATABASE TIER  → namespace: db-ns-helm
-    ├── db-service.yaml              # ─┘
-    │
-    ├── backend-db-alias.yaml        # ─┐
-    ├── backend-secret.yaml          #  │
-    ├── backend-deployment.yaml      #  ├─ BACKEND TIER   → namespace: backend-ns-helm
-    ├── backend-service.yaml         # ─┘
-    │
-    ├── frontend-backend-alias.yaml  # ─┐
-    ├── frontend-deployment.yaml     #  ├─ FRONTEND TIER  → namespace: frontend-ns-helm
-    └── frontend-service.yaml        # ─┘
-```
+AWS / EC2
+┌──────────────────────────────────────────────────────────┐
+│                                                          │
+│   ┌──────────────┐                                       │
+│   │  EC2 Master  │  k3s server (control plane)           │
+│   └──────┬───────┘                                       │
+│          │ schedules pods                                │
+│   ┌──────┴───────┐        ┌──────────────┐               │
+│   │ EC2 Worker 1 │        │ EC2 Worker 2 │  k3s agents   │
+│   │  runs pods   │        │  runs pods   │               │
+│   └──────────────┘        └──────────────┘               │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
 
-Two files are new compared to the original repo: `Chart.yaml` (metadata) and
-`values.yaml` (the answers). Everything in `templates/` is a near-copy of the original
-manifests, with hardcoded literals swapped for `{{ .Values.* }}` references.
-
----
-
-## 3. The Heart of It — `values.yaml`
-
-Every template reads from this one file. Nothing is hardcoded in the templates anymore;
-it all flows from here.
-
-```yaml
-namespaces:
-  db: db-ns-helm
-  backend: backend-ns-helm
-  frontend: frontend-ns-helm
-
-db:
-  image: postgres:16-alpine
-  replicas: 1
-  storage:
-    size: 100Mi
-    className: local-path
-  credentials:
-    user: movieuser
-    password: moviepass
-    database: moviedb
-
-backend:
-  image:
-    repository: raj8875/movie-recommender-backend
-    tag: "2.0"
-  replicas: 1
-  port: 8000
-  tmdbApiKey: "..."        # the ONLY secret you fill in by hand
-
-frontend:
-  image:
-    repository: raj8875/movie-recommender-frontend
-    tag: "2.0"
-  replicas: 1
-  containerPort: 80
-  nodePort: 30080
-```
-
-A template reaches a value by its **dotted path**, e.g. `{{ .Values.db.storage.size }}`
-walks `db → storage → size` and pulls `100Mi`.
-
----
-
-## 4. How Each File Is Wired
-
-### `Chart.yaml`
-Pure metadata. `version` tracks the *chart* (the packaging); `appVersion` tracks the
-*app* (your image tags). They move independently — fix a template typo and bump only
-`version`, while `appVersion` stays at `2.0`.
-
-### `templates/namespaces.yaml`
-Loops over the `namespaces` map instead of hardcoding three blocks.
-
-```
-  .Values.namespaces                      rendered output
-  ──────────────────                      ───────────────
-  db: db-ns-helm          ── range ──►    kind: Namespace  name: db-ns-helm
-  backend: backend-ns-helm                kind: Namespace  name: backend-ns-helm
-  frontend: frontend-ns-helm              kind: Namespace  name: frontend-ns-helm
-```
-
-`{{- range $key, $name := .Values.namespaces }}` walks the map; `$name` is each value.
-
----
-
-### Database tier
-
-**`db-secret.yaml`** — builds the `db-credentials` Secret. Pulls three values:
-
-```
-  .Values.db.credentials.user      ──►  POSTGRES_USER: "movieuser"
-  .Values.db.credentials.password  ──►  POSTGRES_PASSWORD: "moviepass"
-  .Values.db.credentials.database  ──►  POSTGRES_DB: "moviedb"
-```
-
-The `| quote` pipeline wraps each value in `""` so YAML never misreads it.
-
-**`db-statefulset.yaml`** — the Postgres workload. Reads:
-
-```
-  .Values.namespaces.db        ──►  namespace: db-ns-helm
-  .Values.db.replicas          ──►  replicas: 1
-  .Values.db.image             ──►  image: postgres:16-alpine
-  .Values.db.storage.className ──►  storageClassName: local-path
-  .Values.db.storage.size      ──►  storage: 100Mi
-  (envFrom) ──────────────────────► reads the db-credentials Secret above
-```
-
-`serviceName: db` ties it to the headless Service; `volumeClaimTemplates` auto-creates
-the PVC `db-storage-db-0`.
-
-**`db-service.yaml`** — the headless (`clusterIP: None`) Service. Reads only
-`.Values.namespaces.db`. Selects `app: postgres` (the label the StatefulSet sets on its
-pod), exposing port 5432.
-
-```
-  db-statefulset (label app: postgres)  ◄── selector ──  db-service (app: postgres)
+The master decides WHERE pods run; the workers actually run them.
+Your 3 tiers (frontend / backend / db) get scheduled across the workers.
 ```
 
 ---
 
-### Backend tier
+## Application Architecture
 
-**`backend-db-alias.yaml`** — an ExternalName Service named `db`, but living in
-`backend-ns-helm`. This is the cross-namespace bridge. It **builds** its target DNS
-string from a value instead of hardcoding it:
+Each tier lives in a separate **namespace** for isolation. Tiers talk to each other across namespaces through **ExternalName alias services** (explained below), so app code keeps using short names like `db` and `backend`.
 
 ```
-  printf "db.%s.svc.cluster.local"  .Values.namespaces.db
-                  │                          │
-                  └──────────────────────────┘
+                       [ CLIENT BROWSER ]
+                              │
+                              │  http://EC2_IP:30080
                               ▼
-            db.db-ns-helm.svc.cluster.local
+   ┌──────────── namespace: frontend-ns ─────────────────┐
+   │                                                     │
+   │   [ frontend Service ]  NodePort  80 ─► 30080       │
+   │            │                                        │
+   │            ▼                                        │
+   │   [ frontend Pod ]  Nginx                           │
+   │     • serves index.html / script.js (static)        │
+   │     • reverse-proxies /api/ ─► http://backend:8000  │
+   │            │                                        │
+   │            ▼                                        │
+   │   [ backend ]  ExternalName ─► backend.backend-ns   │
+   └────────────────────────┬────────────────────────────┘
+                            │  (in-cluster only)
+                            ▼
+   ┌──────────── namespace: backend-ns ───────────────────┐
+   │                                                      │
+   │   [ backend Service ]  ClusterIP  :8000              │
+   │            │                                         │
+   │            ▼                                         │
+   │   [ backend Pod ]  Node.js API                       │
+   │     • DATABASE_URL = ...@db:5432/moviedb             │
+   │            │                                         │
+   │            ▼                                         │
+   │   [ db ]  ExternalName ─► db.db-ns                   │
+   └────────────────────────┬─────────────────────────────┘
+                            │  (in-cluster only)
+                            ▼
+   ┌──────────── namespace: db-ns ────────────────────────┐
+   │                                                      │
+   │   [ db Service ]  Headless (clusterIP: None)  :5432  │
+   │            │                                         │
+   │            ▼                                         │
+   │   [ db-0 Pod ]  PostgreSQL  (managed by StatefulSet) │
+   │            │  mounts /var/lib/postgresql/data        │
+   │            ▼                                         │
+   │   [ PVC: db-storage-db-0 ] ─► PV on node disk        │
+   └──────────────────────────────────────────────────────┘
+
+   PUBLIC    : only :30080 (frontend NodePort)
+   INTERNAL  : backend :8000 and db :5432 — no public route
 ```
 
-So renaming the db namespace in `values.yaml` automatically updates this alias — it
-can't drift out of sync.
-
-**`backend-secret.yaml`** — builds `backend-secrets`. Two keys, one **assembled** from
-db values, one filled by you:
-
-```
-  DATABASE_URL  = printf "postgresql://%s:%s@db:5432/%s"
-                         db.credentials.user
-                         db.credentials.password
-                         db.credentials.database
-                ──► postgresql://movieuser:moviepass@db:5432/moviedb
-
-  TMDB_API_KEY  = .Values.backend.tmdbApiKey   ◄── the one value you set by hand
-```
-
-Note the host inside `DATABASE_URL` is just `db` — which resolves via the alias above.
-
-**`backend-deployment.yaml`** — the stateless Node/FastAPI pod. Reads:
-
-```
-  .Values.namespaces.backend                              ──► namespace
-  .Values.backend.replicas                                ──► replicas
-  printf "%s:%s" backend.image.repository .image.tag      ──► image: raj8875/...:2.0
-  .Values.backend.port                                    ──► containerPort: 8000
-  (envFrom) ─────────────────────────────────────────────────► reads backend-secrets
-```
-
-**`backend-service.yaml`** — ClusterIP (internal only). Reads `.Values.namespaces.backend`
-and `.Values.backend.port` (used for both `port` and `targetPort`). Selects `app: backend`.
-
-```
-  backend-deployment (label app: backend)  ◄── selector ──  backend-service (app: backend)
-```
+| Tier | Workload | Service type | Port | Public? |
+|:---|:---|:---|:---|:---|
+| Frontend (Nginx) | Deployment | NodePort | 80 → 30080 | ✅ Yes |
+| Backend (Node.js) | Deployment | ClusterIP | 8000 | ❌ Internal |
+| Database (Postgres) | **StatefulSet** | **Headless** | 5432 | ❌ Internal |
 
 ---
 
-### Frontend tier
+## How Connectivity Works (cross-namespace DNS)
 
-**`frontend-backend-alias.yaml`** — ExternalName Service named `backend`, in
-`frontend-ns-helm`. Same printf trick, one tier over:
+In Kubernetes, a **bare hostname only resolves inside its own namespace**. The backend in `backend-ns` can't just say "connect to `db`" — the real `db` lives in `db-ns`. This is solved with **ExternalName services**:
 
-```
-  printf "backend.%s.svc.cluster.local"  .Values.namespaces.backend
-                ──► backend.backend-ns-helm.svc.cluster.local
-```
-
-Nginx's config has `proxy_pass http://backend:8000` baked in; this alias makes the bare
-name `backend` resolve from inside the frontend namespace.
-
-**`frontend-deployment.yaml`** — the Nginx pod. Reads namespace, replicas, the assembled
-image string, and `.Values.frontend.containerPort` (80).
-
-**`frontend-service.yaml`** — NodePort, the only public door. Reads:
+- An ExternalName service is a pure **DNS alias** — no pod, no IP, just "this name means that name."
+- You place the alias **in the namespace that needs it**, pointing at the **full name of the target**.
+- The app keeps using a short hostname; the alias quietly forwards it across the namespace boundary.
 
 ```
-  .Values.namespaces.frontend     ──► namespace
-  .Values.frontend.containerPort  ──► targetPort: 80
-  .Values.frontend.nodePort       ──► nodePort: 30080   ◄── the public port
+ALIAS RESOLUTION
+================
+
+  backend pod asks DNS for:  "db"
+        │
+        ▼
+  backend-ns/db  (ExternalName)
+        │  aliases to
+        ▼
+  db.db-ns.svc.cluster.local
+        │  resolves to
+        ▼
+  db-ns/db  (headless Service)
+        │  routes to
+        ▼
+  db-0 pod  :5432
 ```
+
+- `frontend-ns/backend` → `backend.backend-ns.svc.cluster.local`  (Nginx → API)
+- `backend-ns/db` → `db.db-ns.svc.cluster.local`  (API → database)
+
+**Why headless for the DB?** The `db` service uses `clusterIP: None`. A normal service load-balances behind one virtual IP; a headless service returns the pod's address directly. Since there's exactly one stable DB pod (`db-0`), you want to reach *that pod*, not balance across replicas — which is exactly the pattern a StatefulSet expects.
 
 ---
 
-## 5. The Whole Value Flow, End to End
+## Request Lifecycle (one "Add Movie" click)
 
 ```
-                          values.yaml
-                               │
-        ┌──────────────────────┼───────────────────────┐
-        │                      │                        │
-        ▼                      ▼                        ▼
-   namespaces.*            db.*                  backend.* / frontend.*
-        │                    │                          │
-        │            ┌───────┴────────┐         ┌────────┴────────┐
-        ▼            ▼                ▼         ▼                 ▼
-  namespaces    db-secret       db-statefulset  backend-*        frontend-*
-   (3 ns)           │           db-service       (4 files)        (3 files)
-                    └──envFrom──────┘                 │                │
-                                                      │                │
-                                          DATABASE_URL assembled       │
-                                          from db.credentials.*        │
-                                                      │                │
-                          printf builds cross-ns DNS  │                │
-                          db.db-ns-helm.svc...  ◄──────┘                │
-                          backend.backend-ns-helm.svc...  ◄─────────────┘
+USER REQUEST FLOW
+=================
+
+  [Browser]  click "Add Movie"
+      │  POST /api/movies   (relative path → same origin :30080)
+      ▼
+  [Nginx / frontend pod]
+      │  matches "location /api/"
+      │  proxy_pass ─► http://backend:8000   (via frontend-ns/backend alias)
+      ▼
+  [backend Service :8000] ─► [backend pod / Node.js]
+      │  reads DATABASE_URL
+      │  connects to db:5432   (via backend-ns/db alias → db-0)
+      ▼
+  [db headless svc] ─► [db-0 / PostgreSQL]
+      │  INSERT INTO movies ...
+      ▼
+  [PVC db-storage-db-0]  data written to node disk
+      │
+      ▼
+  Response travels back: Postgres → backend → Nginx → browser
+  [User sees the updated list] ✅
 ```
 
-And the request path at runtime (unchanged from the original app — Helm only changed
-how it's deployed, not how it behaves):
-
-```
-  Browser ──:30080──► frontend NodePort Service
-                          │
-                          ▼
-                      Nginx pod ──proxy /api/──► "backend:8000"
-                                                      │  (resolved by frontend-ns alias)
-                                                      ▼
-                                            backend ClusterIP Service ──► FastAPI pod
-                                                                              │
-                                                              connects to "db:5432"
-                                                              (resolved by backend-ns alias)
-                                                                              ▼
-                                                              db headless Service ──► db-0
-                                                                                       │
-                                                                          writes to PVC on node disk
-```
+**Key isolation facts:**
+- 🔓 Only `:30080` is open to the internet (frontend NodePort).
+- 🔒 Backend `:8000` and db `:5432` are ClusterIP/headless — invisible to outside port scans.
+- 🧱 The only bridges between tiers are the two ExternalName aliases.
 
 ---
 
-## 6. Everyday Commands
+## Project Structure
+
+```
+.
+├── namespaces.yaml                   # creates frontend-ns, backend-ns, db-ns
+├── db/
+│   ├── 02-secret.yaml                # db-credentials: POSTGRES_USER / PASSWORD / DB
+│   ├── statefulset.yaml              # Postgres StatefulSet → pod db-0 + its own PVC
+│   └── service.yaml                  # headless db Service (clusterIP: None)
+├── backend/
+│   ├── 01-db-alias-service.yaml      # ExternalName: db → db.db-ns
+│   ├── 02-secret.yaml                # DATABASE_URL, TMDB_API_KEY
+│   ├── 03-deployment.yaml            # Node.js API (stateless), listens on 8000
+│   └── 04-service.yaml               # backend ClusterIP Service :8000
+└── frontend/
+    ├── 01-backend-alias-service.yaml # ExternalName: backend → backend.backend-ns
+    ├── 02-deployment.yaml            # Nginx pod (static files + reverse proxy)
+    └── 03-service.yaml               # frontend NodePort Service :30080
+```
+
+### What each YAML does
+
+**Root**
+- `namespaces.yaml` — declares the three namespaces. Applied first so everything else has a home.
+
+**Database (`db/`)**
+- `02-secret.yaml` — `db-credentials` secret with `POSTGRES_USER` (`movieuser`), `POSTGRES_PASSWORD`, `POSTGRES_DB` (`moviedb`). Pulled in by the StatefulSet via `envFrom`, so Postgres initializes itself on first boot.
+- `statefulset.yaml` — the Postgres workload. `serviceName: db` ties it to the headless service; `image: postgres:16-alpine`; `envFrom` the secret; and `volumeClaimTemplates` auto-creates the PVC `db-storage-db-0`, mounted at `/var/lib/postgresql/data` with `subPath: postgres-data`.
+- `service.yaml` — the `db` service with `clusterIP: None`, selecting `app: postgres` on port `5432`.
+
+**Backend (`backend/`)**
+- `01-db-alias-service.yaml` — ExternalName so the API can reach `db` across namespaces.
+- `02-secret.yaml` — holds `DATABASE_URL` (connection string using host `db`) and `TMDB_API_KEY`, injected as env vars.
+- `03-deployment.yaml` — the Node.js API. A plain **Deployment** because it's stateless (no data of its own). Listens on `8000`.
+- `04-service.yaml` — ClusterIP `:8000`. No NodePort, so it's never publicly exposed.
+
+**Frontend (`frontend/`)**
+- `01-backend-alias-service.yaml` — ExternalName so Nginx can proxy to `backend` across namespaces.
+- `02-deployment.yaml` — the Nginx pod that serves static files and reverse-proxies `/api/`.
+- `03-service.yaml` — NodePort `:30080`, the single public door into the app.
+
+---
+
+## Why a StatefulSet (and a PVC) for the Database
+
+The frontend and backend are **Deployments** because they're stateless — any pod is interchangeable and can be killed/replaced freely. The database is different: it owns data that must survive restarts.
+
+```
+DEPLOYMENT vs STATEFULSET (for the DB)
+======================================
+
+  Deployment                      StatefulSet
+  ----------                      -----------
+  random pod name                 stable name: db-0
+  db-deployment-7fbd-cf75z        db-0
+  shared/awkward storage          OWN PVC per pod (db-storage-db-0)
+  rolling update: new pod         replaces pods one at a time,
+  starts before old dies          in order — no volume clash
+  → both fight over the same
+    ReadWriteOnce volume
+```
+
+- **A StatefulSet gives the DB a stable identity** (`db-0`) and, via `volumeClaimTemplates`, its **own dedicated PVC** that re-attaches to the same pod across restarts.
+- **It avoids a Deployment pitfall:** a rolling update would try to start a new pod before terminating the old one, and both would fight over the same `ReadWriteOnce` disk and hang.
+- **"Stateful" ≠ "StatefulSet":** what actually persists data is the **PVC** — storage that lives *outside* the pod on the node's disk. The StatefulSet is just the controller that manages stable identity + per-pod PVCs.
+
+```
+WHY A PVC = DATA SURVIVES
+=========================
+
+  No PVC:  data inside pod ─► pod dies ─► ❌ data gone
+  With PVC: data on node disk
+            db-0 dies ─► StatefulSet recreates db-0
+            ─► same PVC re-attached ─► ✅ data still there
+```
+
+> The PVC here is **100Mi** via the k3s `local-path` StorageClass — small on purpose for a learning project. PVCs are easy to grow but hard to shrink, so size up if you ever expect real data.
+
+---
+
+## Deploy
+
+Apply in dependency order: namespaces → database → backend → frontend.
 
 ```bash
-# render to plain YAML, no cluster touched — your debugging tool
-helm template movie-watchlist .
-
-# install / change / undo
-helm install  movie-watchlist .
-helm upgrade  movie-watchlist . --set backend.replicas=2
-helm rollback movie-watchlist 1
-helm uninstall movie-watchlist
-
-# inspect
-helm list                 # current releases + revision number
-helm history movie-watchlist   # full audit trail of every revision
+kubectl apply -f namespaces.yaml
+kubectl apply -f db/
+kubectl apply -f backend/
+kubectl apply -f frontend/
 ```
 
-The two you lean on most while learning: `helm template` (see rendered output) and
-`helm install --dry-run --debug` (validate before committing to the cluster).
+Then open `http://<EC2_PUBLIC_IP>:30080`.
 
 ---
 
-## 7. One Honest Caveat
+## Verify
 
-The two `ExternalName` alias services exist *only* because the app images have hostnames
-(`db`, `backend`) baked in, and a bare hostname resolves only within its own namespace.
-They are a bridge, not a best practice. A simpler design would run all tiers in one
-namespace (no aliases needed) or make the hostnames configurable in the app. The current
-setup keeps the original architecture intact — worth knowing the tradeoff if asked.
+```bash
+kubectl get pods -A                       # db-0 should be 1/1 Running
+kubectl get pvc -n db-ns                  # db-storage-db-0 should be Bound
+kubectl get svc db -n db-ns               # CLUSTER-IP should read None
+kubectl exec -it db-0 -n db-ns -- psql -U movieuser -d moviedb -c "\dt"
+```
+
+**Prove persistence (the whole point of the StatefulSet):**
+
+```bash
+# add a movie in the browser, then:
+kubectl delete pod db-0 -n db-ns          # recreated as db-0 with the same volume
+kubectl get pods -n db-ns -w              # wait for 1/1, reload browser — movie is still there ✅
+```
+
+---
+
+## AWS Security Group
+
+| Port | Source | Purpose |
+|:---|:---|:---|
+| 22 | Your IP | SSH |
+| 30080 | 0.0.0.0/0 | App (frontend NodePort) |
+| 6443 / 10250 / 8472 | Cluster SG only | k3s API / kubelet / Flannel — node-to-node, not public |
+
+Backend (`8000`) and database (`5432`) expose **no public ports**.
+
+---
+
+## Troubleshooting
+
+```bash
+kubectl logs db-0 -n db-ns
+kubectl logs deploy/backend-deployment -n backend-ns
+kubectl exec -it deploy/backend-deployment -n backend-ns -- printenv | grep -i db
+```
+
+- **Backend can't reach DB** → check the `db` alias in `backend-ns` points to `db.db-ns.svc.cluster.local`, and that `DATABASE_URL` uses host `db`.
+- **`db` shows a real CLUSTER-IP instead of `None`** → it wasn't recreated as headless; `clusterIP` is immutable, so delete and re-apply the service.
+- **Empty list after a reset** → expected; the `movies` table auto-recreates on the first backend connection (`CREATE TABLE IF NOT EXISTS`).
