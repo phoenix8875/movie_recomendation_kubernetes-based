@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: {{ .Values.namespaces.frontend }}
+spec:
+  type: ExternalName
+  externalName: {{ printf "backend.%s.svc.cluster.local" .Values.namespaces.backend }}

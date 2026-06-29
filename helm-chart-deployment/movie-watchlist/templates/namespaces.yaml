@@ -1,0 +1,12 @@
+{{- /*
+  Your original file hardcoded three Namespace blocks. Here we loop.
+  range walks the .Values.namespaces map; $name is the value (db-ns, etc).
+  The {{- and -}} chomp whitespace so the rendered YAML stays clean.
+*/ -}}
+{{- range $key, $name := .Values.namespaces }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $name }}
+---
+{{- end }}
