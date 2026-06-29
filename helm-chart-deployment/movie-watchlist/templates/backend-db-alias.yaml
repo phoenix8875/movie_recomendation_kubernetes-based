@@ -1,8 +1,0 @@
-apiVersion: v1
-kind: Service
-metadata:
-  name: db
-  namespace: {{ .Values.namespaces.backend }}
-spec:
-  type: ExternalName
-  externalName: {{ printf "db.%s.svc.cluster.local" .Values.namespaces.db }}
